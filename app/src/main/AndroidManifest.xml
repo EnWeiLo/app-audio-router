@@ -12,8 +12,8 @@
     <application
         android:allowBackup="false"
         android:icon="@android:drawable/ic_lock_silent_mode_off"
-        android:label="App 音效分流測試"
-        android:theme="@android:style/Theme.DeviceDefault">
+        android:label="音效分流"
+        android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
 
         <activity
             android:name=".MainActivity"

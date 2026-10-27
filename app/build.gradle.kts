@@ -11,8 +11,8 @@ android {
         applicationId = "com.enweilo.appaudiorouter"
         minSdk = 29          // 依 UID 分流需要 Android 10 以上
         targetSdk = 34
-        versionCode = 2
-        versionName = "0.2-test"
+        versionCode = 3
+        versionName = "0.3"
     }
 
     // 固定簽章：之後更新版本可以直接覆蓋安裝，不用先解除安裝

@@ -10,4 +10,7 @@ interface IRouterService {
     String clearAll() = 4;
     String activeRoutes() = 5;
     String diagnose(int uid) = 6;
+    int getSpeakerVolume() = 7;
+    int getMaxVolume() = 8;
+    String setSpeakerVolume(int index) = 9;
 }

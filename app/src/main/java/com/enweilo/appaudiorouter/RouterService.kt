@@ -5,6 +5,7 @@ import android.content.pm.PackageManager
 import android.media.AudioDeviceInfo
 import android.media.AudioFormat
 import android.media.AudioManager
+import android.os.Binder
 import android.os.Build
 import android.os.Process
 import org.lsposed.hiddenapibypass.HiddenApiBypass
@@ -142,8 +143,21 @@ class RouterService : IRouterService.Stub {
 
     // ---------------------------------------------------------------- 分流
 
+    /** 以服務自己的身分（shell）執行，避免系統拿呼叫端 App 的 UID 去檢查權限。 */
+    private inline fun <T> asSelf(block: () -> T): T {
+        val id = Binder.clearCallingIdentity()
+        try {
+            return block()
+        } finally {
+            Binder.restoreCallingIdentity(id)
+        }
+    }
+
     @Synchronized
-    override fun route(uid: Int, deviceId: Int, useShellContext: Boolean): String {
+    override fun route(uid: Int, deviceId: Int, useShellContext: Boolean): String =
+        asSelf { routeInternal(uid, deviceId, useShellContext) }
+
+    private fun routeInternal(uid: Int, deviceId: Int, useShellContext: Boolean): String {
         val log = StringBuilder()
         val start = System.currentTimeMillis()
         try {
@@ -230,7 +244,9 @@ class RouterService : IRouterService.Stub {
     }
 
     @Synchronized
-    override fun clearAll(): String {
+    override fun clearAll(): String = asSelf { clearAllInternal() }
+
+    private fun clearAllInternal(): String {
         if (routes.isEmpty()) return "目前沒有任何分流設定"
         val sb = StringBuilder()
         for (r in routes.values) {
@@ -251,6 +267,78 @@ class RouterService : IRouterService.Stub {
         if (routes.isEmpty()) return "目前沒有任何分流設定"
         return "目前生效中的分流：\n" + routes.values.joinToString("\n") {
             "• UID ${it.uid} → ${it.deviceName}（身分 ${it.ctxName}）"
+        }
+    }
+
+    // ---------------------------------------------------------------- 喇叭音量
+
+    private fun shellAudio(): AudioManager =
+        (shellContext() ?: base).getSystemService(AudioManager::class.java)
+
+    private fun speakerDevice(am: AudioManager): AudioDeviceInfo? =
+        am.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+            .firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER }
+
+    private fun deviceAttributes(dev: AudioDeviceInfo): Any =
+        Class.forName("android.media.AudioDeviceAttributes")
+            .getConstructor(AudioDeviceInfo::class.java)
+            .newInstance(dev)
+
+    private fun volumeInfo(am: AudioManager, index: Int?): Any {
+        val intType = Int::class.javaPrimitiveType
+        val bCls = Class.forName("android.media.VolumeInfo\$Builder")
+        val b = bCls.getConstructor(intType).newInstance(AudioManager.STREAM_MUSIC)
+        try {
+            bCls.getMethod("setMinVolumeIndex", intType).invoke(b, am.getStreamMinVolume(AudioManager.STREAM_MUSIC))
+            bCls.getMethod("setMaxVolumeIndex", intType).invoke(b, am.getStreamMaxVolume(AudioManager.STREAM_MUSIC))
+        } catch (_: Throwable) {
+        }
+        if (index != null) bCls.getMethod("setVolumeIndex", intType).invoke(b, index)
+        return bCls.getMethod("build").invoke(b)!!
+    }
+
+    override fun getMaxVolume(): Int = asSelf {
+        shellAudio().getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+    }
+
+    override fun getSpeakerVolume(): Int = asSelf {
+        val am = shellAudio()
+        val dev = speakerDevice(am)
+        val viaApi = if (dev == null) null else try {
+            val viCls = Class.forName("android.media.VolumeInfo")
+            val adaCls = Class.forName("android.media.AudioDeviceAttributes")
+            val r = AudioManager::class.java.getMethod("getDeviceVolume", viCls, adaCls)
+                .invoke(am, volumeInfo(am, null), deviceAttributes(dev))
+            viCls.getMethod("getVolumeIndex").invoke(r) as Int
+        } catch (_: Throwable) {
+            null
+        }
+        if (viaApi != null && viaApi >= 0) viaApi else speakerVolumeFromDump()
+    }
+
+    /** 備用：從 dumpsys audio 的 STREAM_MUSIC 區段讀 "(speaker): N" */
+    private fun speakerVolumeFromDump(): Int {
+        val lines = runCmd("dumpsys", "audio").lines()
+        val i = lines.indexOfFirst { it.contains("STREAM_MUSIC") }
+        if (i < 0) return -1
+        val cur = lines.drop(i).take(12).firstOrNull { it.contains("Current") } ?: return -1
+        return Regex("\\(speaker\\):\\s*(\\d+)").find(cur)?.groupValues?.get(1)?.toIntOrNull() ?: -1
+    }
+
+    override fun setSpeakerVolume(index: Int): String = asSelf {
+        val am = shellAudio()
+        val dev = speakerDevice(am)
+        if (dev == null) {
+            "❌ 找不到手機喇叭"
+        } else try {
+            val viCls = Class.forName("android.media.VolumeInfo")
+            val adaCls = Class.forName("android.media.AudioDeviceAttributes")
+            AudioManager::class.java.getMethod("setDeviceVolume", viCls, adaCls)
+                .invoke(am, volumeInfo(am, index), deviceAttributes(dev))
+            "✅ 手機喇叭音量設為 $index"
+        } catch (t: Throwable) {
+            val root = unwrap(t)
+            "❌ 設定喇叭音量失敗：${root.javaClass.simpleName}: ${root.message}"
         }
     }
 
