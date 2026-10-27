@@ -1,0 +1,294 @@
+package com.enweilo.appaudiorouter
+
+import android.content.Context
+import android.content.pm.PackageManager
+import android.media.AudioDeviceInfo
+import android.media.AudioFormat
+import android.media.AudioManager
+import android.os.Build
+import android.os.Process
+import org.lsposed.hiddenapibypass.HiddenApiBypass
+import java.lang.reflect.InvocationTargetException
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+
+/**
+ * 在 Shizuku 裡（shell 或 root 身分）執行的服務。
+ *
+ * 做法：對選定 App 的 UID 建一個 AudioMix（RULE_MATCH_UID + ROUTE_FLAG_RENDER），
+ * 指定輸出到某個裝置，再用 AudioManager.registerAudioPolicy() 註冊。
+ * 這些都是 @SystemApi，需要 MODIFY_AUDIO_ROUTING 權限，所以用反射呼叫。
+ */
+class RouterService : IRouterService.Stub {
+
+    private class Route(
+        val uid: Int,
+        val deviceName: String,
+        val am: AudioManager,
+        val policy: Any,
+        val ctxName: String,
+    )
+
+    private lateinit var base: Context
+    private val routes = LinkedHashMap<Int, Route>()
+    private var initNote = ""
+
+    constructor() : super() {
+        setup(null)
+    }
+
+    constructor(context: Context) : super() {
+        setup(context)
+    }
+
+    private fun setup(context: Context?) {
+        initNote = try {
+            if (Build.VERSION.SDK_INT >= 28) HiddenApiBypass.addHiddenApiExemptions("L")
+            "隱藏 API 解鎖：OK"
+        } catch (t: Throwable) {
+            "隱藏 API 解鎖失敗：${t.message}"
+        }
+        base = context ?: systemContext()
+    }
+
+    private fun systemContext(): Context {
+        val at = Class.forName("android.app.ActivityThread")
+        val thread = at.getMethod("currentActivityThread").invoke(null)
+            ?: at.getMethod("systemMain").invoke(null)
+        return at.getMethod("getSystemContext").invoke(thread) as Context
+    }
+
+    private fun shellContext(): Context? = try {
+        base.createPackageContext("com.android.shell", 0)
+    } catch (t: Throwable) {
+        null
+    }
+
+    // ---------------------------------------------------------------- 檢查
+
+    override fun probe(): String {
+        val sb = StringBuilder()
+        val uid = Process.myUid()
+        sb.appendLine("【環境】")
+        sb.appendLine("Android ${Build.VERSION.RELEASE}（SDK ${Build.VERSION.SDK_INT}）")
+        sb.appendLine("裝置：${Build.MANUFACTURER} ${Build.MODEL}")
+        sb.appendLine(
+            "服務身分 UID：$uid " + when (uid) {
+                0 -> "（root）"
+                2000 -> "（shell，ADB/無線偵錯模式）"
+                else -> "（未知）"
+            }
+        )
+        sb.appendLine(initNote)
+
+        sb.appendLine()
+        sb.appendLine("【權限】")
+        val perm = "android.permission.MODIFY_AUDIO_ROUTING"
+        val shellHas = try {
+            base.packageManager.checkPermission(perm, "com.android.shell") == PackageManager.PERMISSION_GRANTED
+        } catch (t: Throwable) {
+            null
+        }
+        sb.appendLine(
+            "com.android.shell 有 MODIFY_AUDIO_ROUTING：" + when (shellHas) {
+                true -> "✅ 有"
+                false -> "❌ 沒有"
+                null -> "？查詢失敗"
+            }
+        )
+        val selfHas = base.checkPermission(perm, Process.myPid(), uid) == PackageManager.PERMISSION_GRANTED
+        sb.appendLine("這個服務程序實際拿得到：${if (selfHas) "✅ 是" else "❌ 否"}")
+
+        sb.appendLine()
+        sb.appendLine("【系統 API】")
+        for (name in listOf(
+            "android.media.audiopolicy.AudioPolicy\$Builder",
+            "android.media.audiopolicy.AudioMix\$Builder",
+            "android.media.audiopolicy.AudioMixingRule\$Builder",
+        )) {
+            val ok = try {
+                Class.forName(name); true
+            } catch (t: Throwable) {
+                false
+            }
+            sb.appendLine("${if (ok) "✅" else "❌"} ${name.substringAfterLast('.')}")
+        }
+        val regOk = try {
+            AudioManager::class.java.getMethod("registerAudioPolicy", Class.forName("android.media.audiopolicy.AudioPolicy"))
+            true
+        } catch (t: Throwable) {
+            false
+        }
+        sb.appendLine("${if (regOk) "✅" else "❌"} registerAudioPolicy()")
+        sb.appendLine("shell context：${if (shellContext() != null) "✅ 可建立" else "❌ 無法建立"}")
+
+        sb.appendLine()
+        sb.append(
+            if (selfHas && regOk) "👉 結論：條件齊全，可以進行第 ② 步實際分流測試。"
+            else "👉 結論：權限或 API 不足，分流大概會失敗（還是可以試，看 log 錯在哪）。"
+        )
+        return sb.toString()
+    }
+
+    override fun listDevices(): String {
+        val am = base.getSystemService(AudioManager::class.java)
+        return am.getDevices(AudioManager.GET_DEVICES_OUTPUTS).joinToString("\n") { d ->
+            val product = d.productName?.toString()?.replace('\t', ' ') ?: ""
+            val addr = if (d.address.isNullOrBlank()) "" else " ${d.address}"
+            "${d.id}\t${deviceTypeName(d.type)}\t$product$addr"
+        }
+    }
+
+    // ---------------------------------------------------------------- 分流
+
+    @Synchronized
+    override fun route(uid: Int, deviceId: Int, useShellContext: Boolean): String {
+        val log = StringBuilder()
+        val start = System.currentTimeMillis()
+        try {
+            val ctx = if (useShellContext) {
+                shellContext() ?: base.also { log.appendLine("⚠️ 建不出 shell context，改用預設") }
+            } else base
+            val ctxName = ctx.packageName
+            log.appendLine("使用身分：$ctxName（UID ${Process.myUid()}）")
+
+            val am = ctx.getSystemService(AudioManager::class.java)
+            val dev = am.getDevices(AudioManager.GET_DEVICES_OUTPUTS).firstOrNull { it.id == deviceId }
+            if (dev == null) {
+                log.appendLine("❌ 找不到輸出裝置 id=$deviceId（可能已拔除或斷線，請重選）")
+                return log.toString()
+            }
+            val devName = "${deviceTypeName(dev.type)} ${dev.productName ?: ""}".trim()
+
+            routes.remove(uid)?.let {
+                unregister(it)
+                log.appendLine("已先移除這個 App 舊的分流設定")
+            }
+
+            val policy = buildPolicy(ctx, uid, dev, log)
+            val polCls = Class.forName("android.media.audiopolicy.AudioPolicy")
+            val res = AudioManager::class.java.getMethod("registerAudioPolicy", polCls)
+                .invoke(am, policy) as Int
+            if (res == 0) {
+                routes[uid] = Route(uid, devName, am, policy, ctxName)
+                log.appendLine("✅ registerAudioPolicy 成功（回傳 0）")
+                log.appendLine("UID $uid 的聲音現在應該會走：$devName")
+                log.appendLine("💡 如果那個 App 正在播放，先暫停再播放一次，新路由才會生效。")
+            } else {
+                log.appendLine("❌ registerAudioPolicy 失敗（回傳 $res），看下面 logcat 找原因")
+            }
+        } catch (t: Throwable) {
+            val root = unwrap(t)
+            log.appendLine("❌ 例外：${root.javaClass.simpleName}: ${root.message}")
+        }
+        log.appendLine()
+        log.appendLine("--- 系統 log（音訊相關）---")
+        log.append(logcatSince(start))
+        return log.toString()
+    }
+
+    private fun buildPolicy(ctx: Context, uid: Int, dev: AudioDeviceInfo, log: StringBuilder): Any {
+        val ruleCls = Class.forName("android.media.audiopolicy.AudioMixingRule")
+        val ruleB = Class.forName("android.media.audiopolicy.AudioMixingRule\$Builder")
+        val mixCls = Class.forName("android.media.audiopolicy.AudioMix")
+        val mixB = Class.forName("android.media.audiopolicy.AudioMix\$Builder")
+        val polB = Class.forName("android.media.audiopolicy.AudioPolicy\$Builder")
+        val intType = Int::class.javaPrimitiveType
+
+        val rb = ruleB.getConstructor().newInstance()
+        ruleB.getMethod("addMixRule", intType, Any::class.java).invoke(rb, RULE_MATCH_UID, uid)
+        val rule = ruleB.getMethod("build").invoke(rb)
+        log.appendLine("✔ 規則建立：只比對 UID $uid")
+
+        val format = AudioFormat.Builder()
+            .setSampleRate(48000)
+            .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+            .setChannelMask(AudioFormat.CHANNEL_OUT_STEREO)
+            .build()
+        val mb = mixB.getConstructor(ruleCls).newInstance(rule)
+        mixB.getMethod("setFormat", AudioFormat::class.java).invoke(mb, format)
+        mixB.getMethod("setRouteFlags", intType).invoke(mb, ROUTE_FLAG_RENDER)
+        mixB.getMethod("setDevice", AudioDeviceInfo::class.java).invoke(mb, dev)
+        val mix = mixB.getMethod("build").invoke(mb)
+        log.appendLine("✔ AudioMix 建立：輸出到 ${deviceTypeName(dev.type)}")
+
+        val pb = polB.getConstructor(Context::class.java).newInstance(ctx)
+        polB.getMethod("addMix", mixCls).invoke(pb, mix)
+        val policy = polB.getMethod("build").invoke(pb)!!
+        log.appendLine("✔ AudioPolicy 建立完成，準備註冊…")
+        return policy
+    }
+
+    private fun unregister(r: Route) {
+        val polCls = Class.forName("android.media.audiopolicy.AudioPolicy")
+        try {
+            AudioManager::class.java.getMethod("unregisterAudioPolicy", polCls).invoke(r.am, r.policy)
+        } catch (e: NoSuchMethodException) {
+            AudioManager::class.java.getMethod("unregisterAudioPolicyAsync", polCls).invoke(r.am, r.policy)
+        }
+    }
+
+    @Synchronized
+    override fun clearAll(): String {
+        if (routes.isEmpty()) return "目前沒有任何分流設定"
+        val sb = StringBuilder()
+        for (r in routes.values) {
+            try {
+                unregister(r)
+                sb.appendLine("✅ 已還原 UID ${r.uid}")
+            } catch (t: Throwable) {
+                sb.appendLine("❌ UID ${r.uid} 還原失敗：${unwrap(t).message}")
+            }
+        }
+        routes.clear()
+        sb.append("全部還原完成，聲音回到系統預設路由")
+        return sb.toString()
+    }
+
+    @Synchronized
+    override fun activeRoutes(): String {
+        if (routes.isEmpty()) return "目前沒有任何分流設定"
+        return "目前生效中的分流：\n" + routes.values.joinToString("\n") {
+            "• UID ${it.uid} → ${it.deviceName}（身分 ${it.ctxName}）"
+        }
+    }
+
+    override fun destroy() {
+        try {
+            clearAll()
+        } catch (_: Throwable) {
+        }
+        System.exit(0)
+    }
+
+    // ---------------------------------------------------------------- 工具
+
+    private fun unwrap(t: Throwable): Throwable {
+        var e: Throwable = t
+        while (true) {
+            val next = (e as? InvocationTargetException)?.targetException ?: e.cause
+            if (next == null || next === e) return e
+            e = next
+        }
+    }
+
+    private fun logcatSince(startMs: Long): String = try {
+        val ts = SimpleDateFormat("MM-dd HH:mm:ss.SSS", Locale.US).format(Date(startMs - 1000))
+        val p = ProcessBuilder("logcat", "-d", "-v", "brief", "-t", ts)
+            .redirectErrorStream(true)
+            .start()
+        val lines = p.inputStream.bufferedReader().readLines()
+        p.waitFor()
+        val keys = listOf("Audio", "audio", "APM", "olicy")
+        val hit = lines.filter { line -> keys.any { line.contains(it) } }.takeLast(40)
+        if (hit.isEmpty()) "（沒有相關 log）" else hit.joinToString("\n")
+    } catch (t: Throwable) {
+        "（讀不到 logcat：${t.message}）"
+    }
+
+    companion object {
+        private const val RULE_MATCH_UID = 1 shl 2
+        private const val ROUTE_FLAG_RENDER = 1
+    }
+}
