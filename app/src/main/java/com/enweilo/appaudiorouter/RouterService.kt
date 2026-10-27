@@ -254,6 +254,84 @@ class RouterService : IRouterService.Stub {
         }
     }
 
+    // ---------------------------------------------------------------- 診斷
+
+    override fun diagnose(uid: Int): String {
+        val sb = StringBuilder()
+        val uidWord = Regex("\\b$uid\\b")
+        val am = base.getSystemService(AudioManager::class.java)
+        val outputs = am.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+
+        sb.appendLine("【裝置 id 對照】")
+        sb.appendLine(outputs.joinToString("、") { "${it.id}=${deviceTypeName(it.type)}" })
+
+        // 1. dumpsys audio：播放紀錄（含 deviceIds）與各裝置的媒體音量
+        val audio = runCmd("dumpsys", "audio")
+        val audioLines = audio.lines()
+        sb.appendLine()
+        sb.appendLine("【UID $uid 的播放狀態（deviceIds = 實際輸出裝置）】")
+        val plays = audioLines.filter { it.contains("u/pid:$uid/") || (it.contains("piid") && uidWord.containsMatchIn(it)) }
+        if (plays.isEmpty()) sb.appendLine("（沒找到，這個 App 現在可能沒在播放）")
+        else plays.takeLast(6).forEach { sb.appendLine(it.trim()) }
+
+        sb.appendLine()
+        sb.appendLine("【媒體音量（各裝置分開記）】")
+        val musicIdx = audioLines.indexOfFirst { it.contains("STREAM_MUSIC") }
+        if (musicIdx >= 0) {
+            audioLines.drop(musicIdx).take(12)
+                .filter { it.contains("Current") || it.contains("Muted") || it.contains("Max") || it.contains("Min") }
+                .forEach { sb.appendLine(it.trim()) }
+        } else sb.appendLine("（找不到 STREAM_MUSIC 區段）")
+        sb.appendLine("目前媒體音量（當下預設裝置）：${am.getStreamVolume(AudioManager.STREAM_MUSIC)}/${am.getStreamMaxVolume(AudioManager.STREAM_MUSIC)}")
+
+        // 2. dumpsys media.audio_policy：哪個輸出通道上有這個 UID，以及那個通道接到哪個裝置
+        val pol = runCmd("dumpsys", "media.audio_policy").lines()
+        sb.appendLine()
+        sb.appendLine("【音訊策略：UID $uid 所在的輸出通道】")
+        var curOutput = ""
+        var curDevices = ""
+        val shown = HashSet<String>()
+        var found = 0
+        for (line in pol) {
+            val t = line.trim()
+            if (Regex("Output \\d+").containsMatchIn(t) && t.contains("dump", ignoreCase = true)) {
+                curOutput = t; curDevices = ""
+            } else if (t.startsWith("Devices") || t.startsWith("Device:") || t.contains("Devices:")) {
+                curDevices = t.take(200)
+            }
+            if (uidWord.containsMatchIn(t) && (t.contains("uid", true) || t.contains("Client", true))) {
+                val key = "$curOutput|$curDevices"
+                if (shown.add(key)) {
+                    sb.appendLine("▸ $curOutput")
+                    if (curDevices.isNotEmpty()) sb.appendLine("  $curDevices")
+                }
+                sb.appendLine("  ${t.take(220)}")
+                if (++found >= 8) break
+            }
+        }
+        if (found == 0) sb.appendLine("（沒找到這個 UID 的播放 client）")
+
+        sb.appendLine()
+        sb.appendLine("【已註冊的 Policy Mix】")
+        val mixIdx = pol.indexOfFirst { it.contains("Policy Mix", true) }
+        if (mixIdx >= 0) pol.drop(mixIdx).take(14).forEach { sb.appendLine(it.trim().take(200)) }
+        else sb.appendLine("（dump 裡沒有 Policy Mix 區段）")
+
+        sb.appendLine()
+        sb.appendLine("--- 最近幾秒的系統 log ---")
+        sb.append(logcatSince(System.currentTimeMillis() - 5000))
+        return sb.toString()
+    }
+
+    private fun runCmd(vararg cmd: String): String = try {
+        val p = ProcessBuilder(*cmd).redirectErrorStream(true).start()
+        val out = p.inputStream.bufferedReader().readText()
+        p.waitFor()
+        out
+    } catch (t: Throwable) {
+        "（執行 ${cmd.joinToString(" ")} 失敗：${t.message}）"
+    }
+
     override fun destroy() {
         try {
             clearAll()

@@ -9,4 +9,5 @@ interface IRouterService {
     String route(int uid, int deviceId, boolean useShellContext) = 3;
     String clearAll() = 4;
     String activeRoutes() = 5;
+    String diagnose(int uid) = 6;
 }

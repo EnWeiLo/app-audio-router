@@ -175,6 +175,8 @@ class MainActivity : Activity() {
             button("目前設定") { runOnService("查詢") { it.activeRoutes() } },
         ))
 
+        root.addView(button("③ 診斷：聲音實際走去哪") { runDiagnose() }, fullWidth())
+
         root.addView(row(
             button("複製紀錄") { copyLog() },
             button("清除紀錄") { logView.text = "" },
@@ -387,6 +389,33 @@ class MainActivity : Activity() {
         }
         val useShell = shellBox.isChecked
         runOnService("把「${app.label}」分流到 ${dev.name}") { it.route(app.uid, dev.id, useShell) }
+    }
+
+    private fun runDiagnose() {
+        val app = selectedApp
+        if (app == null) {
+            log("⚠️ 請先選 App（要診斷哪個 App 的聲音）")
+            return
+        }
+        val s = service
+        if (s == null) {
+            log("⚠️ 還沒連上服務，請先按「連線 Shizuku」")
+            return
+        }
+        val isSelf = app.pkg == packageName
+        if (isSelf && !tone.isPlaying) toggleTone()
+        if (!isSelf) log("💡 請確認「${app.label}」現在正在播放聲音")
+        log("▶ 診斷中（約 2 秒）…")
+        bg.execute {
+            Thread.sleep(1500)
+            val result = try {
+                s.diagnose(app.uid)
+            } catch (t: Throwable) {
+                "❌ ${t.javaClass.simpleName}: ${t.message}"
+            }
+            log(result)
+            log("👉 按「複製紀錄」貼給 Claude。測試音還在播，聽完可以按「停止測試音」。")
+        }
     }
 
     // ---------------------------------------------------------------- 其他
