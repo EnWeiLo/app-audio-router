@@ -7,9 +7,11 @@ import android.media.AudioFormat
 import android.media.AudioManager
 import android.os.Binder
 import android.os.Build
+import android.os.IBinder
 import android.os.Process
 import org.lsposed.hiddenapibypass.HiddenApiBypass
 import java.lang.reflect.InvocationTargetException
+import java.lang.reflect.Method
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -304,16 +306,54 @@ class RouterService : IRouterService.Stub {
     override fun getSpeakerVolume(): Int = asSelf {
         val am = shellAudio()
         val dev = speakerDevice(am)
-        val viaApi = if (dev == null) null else try {
-            val viCls = Class.forName("android.media.VolumeInfo")
-            val adaCls = Class.forName("android.media.AudioDeviceAttributes")
-            val r = AudioManager::class.java.getMethod("getDeviceVolume", viCls, adaCls)
-                .invoke(am, volumeInfo(am, null), deviceAttributes(dev))
-            viCls.getMethod("getVolumeIndex").invoke(r) as Int
-        } catch (_: Throwable) {
-            null
+        // dumpsys 的數字最可靠，優先用；讀不到才試系統 API
+        val fromDump = speakerVolumeFromDump()
+        if (fromDump >= 0 || dev == null) {
+            fromDump
+        } else {
+            val vi = volumeInfo(am, null)
+            val ada = deviceAttributes(dev)
+            var result = -1
+            for ((_, obj) in volumeTargets(am)) {
+                val m = obj.javaClass.methods.firstOrNull { it.name == "getDeviceVolume" && argsFor(it, vi, ada) != null }
+                    ?: continue
+                try {
+                    val r = m.invoke(obj, *argsFor(m, vi, ada)!!)
+                    result = Class.forName("android.media.VolumeInfo").getMethod("getVolumeIndex").invoke(r) as Int
+                    break
+                } catch (_: Throwable) {
+                }
+            }
+            result
         }
-        if (viaApi != null && viaApi >= 0) viaApi else speakerVolumeFromDump()
+    }
+
+    /** 可能有音量方法的物件：AudioManager 本身，以及系統音訊服務 IAudioService */
+    private fun volumeTargets(am: AudioManager): List<Pair<String, Any>> {
+        val list = mutableListOf<Pair<String, Any>>("AudioManager" to am)
+        try {
+            val sm = Class.forName("android.os.ServiceManager")
+            val binder = sm.getMethod("getService", String::class.java).invoke(null, "audio") as IBinder
+            val stub = Class.forName("android.media.IAudioService\$Stub")
+            val svc = stub.getMethod("asInterface", IBinder::class.java).invoke(null, binder)
+            if (svc != null) list.add("IAudioService" to svc)
+        } catch (_: Throwable) {
+        }
+        return list
+    }
+
+    /** 依參數型別自動填參數；有不認得的型別就回傳 null（代表不適用） */
+    private fun argsFor(m: Method, vi: Any, ada: Any): Array<Any?>? {
+        val out = arrayOfNulls<Any>(m.parameterTypes.size)
+        for ((i, t) in m.parameterTypes.withIndex()) {
+            out[i] = when (t.name) {
+                "android.media.VolumeInfo" -> vi
+                "android.media.AudioDeviceAttributes" -> ada
+                "java.lang.String" -> "com.android.shell"
+                else -> return null
+            }
+        }
+        return out
     }
 
     /** 備用：從 dumpsys audio 的 STREAM_MUSIC 區段讀 "(speaker): N" */
@@ -330,16 +370,74 @@ class RouterService : IRouterService.Stub {
         val dev = speakerDevice(am)
         if (dev == null) {
             "❌ 找不到手機喇叭"
-        } else try {
-            val viCls = Class.forName("android.media.VolumeInfo")
-            val adaCls = Class.forName("android.media.AudioDeviceAttributes")
-            AudioManager::class.java.getMethod("setDeviceVolume", viCls, adaCls)
-                .invoke(am, volumeInfo(am, index), deviceAttributes(dev))
-            "✅ 手機喇叭音量設為 $index"
-        } catch (t: Throwable) {
-            val root = unwrap(t)
-            "❌ 設定喇叭音量失敗：${root.javaClass.simpleName}: ${root.message}"
+        } else {
+            setSpeakerVolumeInternal(am, dev, index)
         }
+    }
+
+    private fun setSpeakerVolumeInternal(am: AudioManager, dev: AudioDeviceInfo, index: Int): String {
+        val errors = mutableListOf<String>()
+        val targets = volumeTargets(am)
+        val vi = try {
+            volumeInfo(am, index)
+        } catch (t: Throwable) {
+            null
+        }
+        val ada = deviceAttributes(dev)
+
+        // 做法 1：setDeviceVolume(VolumeInfo, AudioDeviceAttributes[, String])
+        if (vi != null) {
+            for ((label, obj) in targets) {
+                for (m in obj.javaClass.methods.filter { it.name == "setDeviceVolume" }) {
+                    val args = argsFor(m, vi, ada) ?: continue
+                    try {
+                        m.invoke(obj, *args)
+                        return "✅ 手機喇叭音量設為 $index（$label.setDeviceVolume）"
+                    } catch (t: Throwable) {
+                        val r = unwrap(t)
+                        errors.add("$label.setDeviceVolume：${r.javaClass.simpleName}: ${r.message}")
+                    }
+                }
+            }
+        } else errors.add("VolumeInfo 建立失敗")
+
+        // 做法 2：setStreamVolumeForDevice(stream, index, nativeDevice[, String])
+        for ((label, obj) in targets) {
+            for (m in obj.javaClass.methods.filter { it.name == "setStreamVolumeForDevice" }) {
+                val ints = intArrayOf(AudioManager.STREAM_MUSIC, index, NATIVE_OUT_SPEAKER)
+                var k = 0
+                val args = arrayOfNulls<Any>(m.parameterTypes.size)
+                var ok = true
+                for ((i, t) in m.parameterTypes.withIndex()) {
+                    args[i] = when {
+                        t == Int::class.javaPrimitiveType && k < ints.size -> ints[k++]
+                        t == String::class.java -> "com.android.shell"
+                        else -> { ok = false; null }
+                    }
+                }
+                if (!ok || k < ints.size) continue
+                try {
+                    m.invoke(obj, *args)
+                    return "✅ 手機喇叭音量設為 $index（$label.setStreamVolumeForDevice）"
+                } catch (t: Throwable) {
+                    val r = unwrap(t)
+                    errors.add("$label.setStreamVolumeForDevice：${r.javaClass.simpleName}: ${r.message}")
+                }
+            }
+        }
+
+        // 全部失敗：列出這台手機有的相關方法，方便下一步判斷
+        val sb = StringBuilder("❌ 設定喇叭音量失敗\n")
+        if (errors.isEmpty()) sb.appendLine("（找不到可用的方法）") else errors.forEach { sb.appendLine("• $it") }
+        sb.appendLine("這台手機上的相關方法：")
+        for ((label, obj) in targets) {
+            obj.javaClass.methods
+                .filter { it.name.contains("Volume") && (it.name.contains("Device") || it.name.contains("ForDevice")) }
+                .map { m -> "$label.${m.name}(${m.parameterTypes.joinToString(", ") { it.simpleName }})" }
+                .distinct()
+                .forEach { sb.appendLine("  $it") }
+        }
+        return sb.toString().trimEnd()
     }
 
     // ---------------------------------------------------------------- 診斷
@@ -456,5 +554,6 @@ class RouterService : IRouterService.Stub {
     companion object {
         private const val RULE_MATCH_UID = 1 shl 2
         private const val ROUTE_FLAG_RENDER = 1
+        private const val NATIVE_OUT_SPEAKER = 0x2
     }
 }
