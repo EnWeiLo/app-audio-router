@@ -486,6 +486,24 @@ class RouterService : IRouterService.Stub {
         return sb.toString().trimEnd()
     }
 
+    // ---------------------------------------------------------------- 音訊焦點
+
+    /**
+     * ignore = true：這個 App 要求音訊焦點時，系統不會叫其他正在播放的 App 暫停。
+     * 設定會永久保存（重開機也在），所以要能還原成 default。
+     */
+    override fun setFocusIgnore(pkg: String, ignore: Boolean): String = asSelf {
+        val mode = if (ignore) "ignore" else "default"
+        val out = runCmd("cmd", "appops", "set", pkg, "TAKE_AUDIO_FOCUS", mode).trim()
+        val now = runCmd("cmd", "appops", "get", pkg, "TAKE_AUDIO_FOCUS").trim()
+        val okNow = if (ignore) now.contains("ignore") else !now.contains("ignore")
+        when {
+            okNow && ignore -> "✅ $pkg 已設為不搶音訊焦點（可和音樂同時播放）"
+            okNow -> "✅ $pkg 的音訊焦點已還原"
+            else -> "❌ 音訊焦點設定沒生效：${out.ifEmpty { "（無輸出）" }}\n目前狀態：${now.ifEmpty { "（無輸出）" }}"
+        }
+    }
+
     // ---------------------------------------------------------------- 診斷
 
     override fun diagnose(uid: Int): String {

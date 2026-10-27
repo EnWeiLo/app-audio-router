@@ -13,4 +13,5 @@ interface IRouterService {
     int getSpeakerVolume() = 7;
     int getMaxVolume() = 8;
     String setSpeakerVolume(int index) = 9;
+    String setFocusIgnore(String pkg, boolean ignore) = 10;
 }

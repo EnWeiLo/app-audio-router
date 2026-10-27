@@ -37,6 +37,8 @@ import android.widget.LinearLayout
 import android.widget.ListView
 import android.widget.ScrollView
 import android.widget.SeekBar
+import android.widget.Switch
+import android.content.res.ColorStateList
 import android.widget.TextView
 import android.widget.Toast
 import rikka.shizuku.Shizuku
@@ -95,6 +97,8 @@ class MainActivity : Activity() {
     private lateinit var toneBtn: TextView
     private lateinit var logText: TextView
     private lateinit var logToggle: TextView
+    private lateinit var focusSwitch: Switch
+    private val prefs by lazy { getSharedPreferences("router", MODE_PRIVATE) }
 
     private val serviceArgs by lazy {
         Shizuku.UserServiceArgs(ComponentName(packageName, RouterService::class.java.name))
@@ -252,9 +256,38 @@ class MainActivity : Activity() {
         }
         routeCard.addView(pickerRow("輸出到", devEmoji, devValue) { pickDevice() }, lpTop(10))
 
+        focusSwitch = Switch(this).apply {
+            isChecked = prefs.getBoolean(KEY_FOCUS_DEFAULT, true)
+            thumbTintList = ColorStateList(
+                arrayOf(intArrayOf(android.R.attr.state_checked), intArrayOf()),
+                intArrayOf(Color.WHITE, Color.argb(220, 255, 255, 255))
+            )
+            trackTintList = ColorStateList(
+                arrayOf(intArrayOf(android.R.attr.state_checked), intArrayOf()),
+                intArrayOf(Palette.accentA, Color.argb(70, 255, 255, 255))
+            )
+            setOnCheckedChangeListener { _, c -> prefs.edit().putBoolean(KEY_FOCUS_DEFAULT, c).apply() }
+        }
+        val focusRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            val r = dpf(20)
+            background = GlassDrawable(r, Color.argb(16, 255, 255, 255), 2f, 28)
+            setPadding(dp(16), dp(10), dp(10), dp(10))
+            val col = LinearLayout(context).apply {
+                orientation = LinearLayout.VERTICAL
+                addView(label("和音樂同時播放", 15f, Palette.text, bold = true))
+                addView(label("不讓這個 App 打斷正在播的音樂", 12f, Palette.textDim))
+            }
+            addView(col, LinearLayout.LayoutParams(0, WRAP, 1f))
+            addView(focusSwitch)
+            setOnClickListener { focusSwitch.toggle() }
+        }
+        routeCard.addView(focusRow, lpTop(10))
+
         routeCard.addView(row(
             capsule("套用分流", primary = true) { applyRoute() },
-            capsule("全部還原", primary = false) { runOnService("還原") { it.clearAll() } },
+            capsule("全部還原", primary = false) { restoreAll() },
         ), lpTop(16))
 
         resultText = label("", 13f, Palette.textDim).apply {
@@ -780,6 +813,7 @@ class MainActivity : Activity() {
             toast("請先連線 Shizuku")
             return
         }
+        val wantIgnore = focusSwitch.isChecked && app.pkg != packageName
         log("▶ 分流「${app.label}」→ ${dev.typeName}")
         bg.execute {
             val result = try {
@@ -789,15 +823,62 @@ class MainActivity : Activity() {
             }
             log(result)
             val ok = result.contains("registerAudioPolicy 成功")
+
+            // 音訊焦點：開關開著就設 ignore，關著就還原
+            var focusLine = ""
+            if (ok && app.pkg != packageName) {
+                val fr = try {
+                    s.setFocusIgnore(app.pkg, wantIgnore)
+                } catch (t: Throwable) {
+                    "❌ ${t.javaClass.simpleName}: ${t.message}"
+                }
+                log(fr)
+                val set = HashSet(prefs.getStringSet(KEY_FOCUS_PKGS, emptySet()) ?: emptySet())
+                if (wantIgnore && fr.startsWith("✅")) set.add(app.pkg) else if (!wantIgnore) set.remove(app.pkg)
+                prefs.edit().putStringSet(KEY_FOCUS_PKGS, set).apply()
+                focusLine = when {
+                    !fr.startsWith("✅") -> "\n⚠️ 同時播放設定失敗，詳情請看紀錄"
+                    wantIgnore -> "\n♪ 不會打斷正在播的音樂"
+                    else -> ""
+                }
+            }
             main.post {
                 resultText.visibility = View.VISIBLE
                 if (ok) {
                     resultText.setTextColor(Palette.good)
-                    resultText.text = "✓ 已分流：${app.label} → ${dev.typeName}\n正在播放的話，暫停再播放一次就會生效。"
+                    resultText.text = "✓ 已分流：${app.label} → ${dev.typeName}$focusLine\n" +
+                        "這個 App 正在播放的話，先完全關掉再重開一次。"
                 } else {
                     resultText.setTextColor(Palette.bad)
                     resultText.text = "✕ 分流失敗，詳情請看下方紀錄"
                 }
+            }
+        }
+    }
+
+    private fun restoreAll() {
+        val s = service
+        if (s == null) {
+            toast("請先連線 Shizuku")
+            return
+        }
+        log("▶ 全部還原…")
+        bg.execute {
+            val sb = StringBuilder()
+            sb.appendLine(try { s.clearAll() } catch (t: Throwable) { "❌ ${t.message}" })
+            val pkgs = prefs.getStringSet(KEY_FOCUS_PKGS, emptySet()) ?: emptySet()
+            val left = HashSet<String>()
+            for (p in pkgs) {
+                val r = try { s.setFocusIgnore(p, false) } catch (t: Throwable) { "❌ ${t.message}" }
+                sb.appendLine(r)
+                if (!r.startsWith("✅")) left.add(p)
+            }
+            prefs.edit().putStringSet(KEY_FOCUS_PKGS, left).apply()
+            log(sb.toString().trimEnd())
+            main.post {
+                resultText.visibility = View.VISIBLE
+                resultText.setTextColor(Palette.textDim)
+                resultText.text = "已全部還原：聲音路由和音訊焦點都回到系統預設"
             }
         }
     }
@@ -933,6 +1014,8 @@ class MainActivity : Activity() {
 
     companion object {
         private const val REQ_SHIZUKU = 1001
+        private const val KEY_FOCUS_PKGS = "focus_ignored_pkgs"
+        private const val KEY_FOCUS_DEFAULT = "focus_switch"
         private const val MATCH = ViewGroup.LayoutParams.MATCH_PARENT
         private const val WRAP = ViewGroup.LayoutParams.WRAP_CONTENT
     }
