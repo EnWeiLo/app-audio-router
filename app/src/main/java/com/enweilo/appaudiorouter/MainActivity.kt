@@ -834,9 +834,9 @@ class MainActivity : Activity() {
             }
             log(msg)
             main.post {
-                if (msg.startsWith("❌")) {
+                if (!msg.startsWith("✅")) {
                     volumeHint.setTextColor(Palette.bad)
-                    volumeHint.text = "設定失敗，詳情請看紀錄"
+                    volumeHint.text = if (msg.startsWith("⚠️")) "系統沒有套用這個音量，詳情請看紀錄" else "設定失敗，詳情請看紀錄"
                 } else {
                     volumeHint.setTextColor(Palette.textFaint)
                     volumeHint.text = "連著藍牙時也能單獨調整。分流到喇叭的 App 會用這個音量。"

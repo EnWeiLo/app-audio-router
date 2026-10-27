@@ -2,6 +2,7 @@ package com.enweilo.appaudiorouter
 
 import android.content.Context
 import android.content.pm.PackageManager
+import android.media.AudioAttributes
 import android.media.AudioDeviceInfo
 import android.media.AudioFormat
 import android.media.AudioManager
@@ -303,12 +304,34 @@ class RouterService : IRouterService.Stub {
         shellAudio().getStreamMaxVolume(AudioManager.STREAM_MUSIC)
     }
 
-    override fun getSpeakerVolume(): Int = asSelf {
-        val am = shellAudio()
+    override fun getSpeakerVolume(): Int = asSelf { readSpeakerVolume(shellAudio()) }
+
+    /** 媒體聲音現在是不是正從手機喇叭出來（藍牙、有線耳機都沒接時就是） */
+    private fun speakerIsActive(am: AudioManager): Boolean {
+        try {
+            val attrs = AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA).build()
+            val list = AudioManager::class.java
+                .getMethod("getDevicesForAttributes", AudioAttributes::class.java)
+                .invoke(am, attrs) as List<*>
+            val typeM = Class.forName("android.media.AudioDeviceAttributes").getMethod("getType")
+            return list.any { typeM.invoke(it) == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER }
+        } catch (_: Throwable) {
+        }
+        // 備用判斷：沒有任何外接輸出就當作喇叭在用
+        val external = setOf(
+            AudioDeviceInfo.TYPE_BLUETOOTH_A2DP, AudioDeviceInfo.TYPE_WIRED_HEADSET,
+            AudioDeviceInfo.TYPE_WIRED_HEADPHONES, AudioDeviceInfo.TYPE_USB_HEADSET,
+            AudioDeviceInfo.TYPE_USB_DEVICE, AudioDeviceInfo.TYPE_HDMI, 26, 27,
+        )
+        return am.getDevices(AudioManager.GET_DEVICES_OUTPUTS).none { it.type in external }
+    }
+
+    private fun readSpeakerVolume(am: AudioManager): Int {
+        if (speakerIsActive(am)) return am.getStreamVolume(AudioManager.STREAM_MUSIC)
         val dev = speakerDevice(am)
         // dumpsys 的數字最可靠，優先用；讀不到才試系統 API
         val fromDump = speakerVolumeFromDump()
-        if (fromDump >= 0 || dev == null) {
+        return if (fromDump >= 0 || dev == null) {
             fromDump
         } else {
             val vi = volumeInfo(am, null)
@@ -359,7 +382,8 @@ class RouterService : IRouterService.Stub {
     /** 備用：從 dumpsys audio 的 STREAM_MUSIC 區段讀 "(speaker): N" */
     private fun speakerVolumeFromDump(): Int {
         val lines = runCmd("dumpsys", "audio").lines()
-        val i = lines.indexOfFirst { it.contains("STREAM_MUSIC") }
+        var i = lines.indexOfFirst { it.trim().startsWith("- STREAM_MUSIC") }
+        if (i < 0) i = lines.indexOfFirst { it.contains("STREAM_MUSIC") }
         if (i < 0) return -1
         val cur = lines.drop(i).take(12).firstOrNull { it.contains("Current") } ?: return -1
         return Regex("\\(speaker\\):\\s*(\\d+)").find(cur)?.groupValues?.get(1)?.toIntOrNull() ?: -1
@@ -371,7 +395,29 @@ class RouterService : IRouterService.Stub {
         if (dev == null) {
             "❌ 找不到手機喇叭"
         } else {
-            setSpeakerVolumeInternal(am, dev, index)
+            val active = speakerIsActive(am)
+            val msg = if (active) {
+                // 喇叭正在當媒體輸出：setDeviceVolume 會被系統略過，改用一般音量設定
+                try {
+                    am.setStreamVolume(AudioManager.STREAM_MUSIC, index, 0)
+                    "✅ 手機喇叭音量設為 $index（喇叭是目前的媒體輸出，用一般音量設定）"
+                } catch (t: Throwable) {
+                    val r = unwrap(t)
+                    "❌ 設定喇叭音量失敗：${r.javaClass.simpleName}: ${r.message}"
+                }
+            } else {
+                setSpeakerVolumeInternal(am, dev, index)
+            }
+            if (!msg.startsWith("✅")) {
+                msg
+            } else {
+                // 回讀確認，數字對不上就老實說沒生效
+                Thread.sleep(200)
+                val now = readSpeakerVolume(am)
+                if (now == index) msg
+                else "⚠️ 系統回報成功，但喇叭音量實際是 $now（目標 $index），沒有生效\n" +
+                    "（判斷喇叭是否正在使用：${if (active) "是" else "否"}）"
+            }
         }
     }
 
